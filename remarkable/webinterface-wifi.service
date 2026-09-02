@@ -1,0 +1,15 @@
+[Unit]
+Description=xochitl web interface proxied onto wifi
+After=home.mount network-online.target
+Wants=network-online.target
+RequiresMountsFor=/home/root
+
+[Service]
+Environment=HOME=/home/root
+Environment=WEBINT_WIFI_RUN_ENV=DAEMON
+ExecStart=/home/root/.local/bin/webinterface-wifi local-exec
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
