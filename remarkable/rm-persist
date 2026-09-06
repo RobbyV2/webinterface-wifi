@@ -17,17 +17,20 @@
 # the real /etc, so one code path serves every device.
 #
 # The other root partition is the fallback, so it only ever receives units
-# from a system that has proven them: at shutdown, after a boot that reached
-# multi-user.target with xochitl running, and from swupdate's post-update
-# command, which runs on the old system right after it has written the new
-# partition. install and boot never touch it. A unit that breaks boot is
+# from a boot that has proven them: one that started with exactly this unit
+# set, recorded in a manifest at boot, and reached multi-user.target with
+# xochitl running. Staging into it happens at shutdown of such a boot and from
+# swupdate's post-update command, which runs on the old system right after it
+# has written the new partition. install and boot never touch it, and a unit
+# added during a boot waits for the next one. A unit that breaks boot is
 # therefore confined to one partition, and the other one still boots.
 #
-# Units ordered into early boot are refused outright. Anything carrying
-# DefaultDependencies=no, or Before= or WantedBy= naming sysinit.target,
-# basic.target, local-fs.target or cryptsetup.target, can form an ordering
-# cycle with the encrypted /home and leave PID 1 frozen. Third-party units on
-# these tablets belong at multi-user.target or sockets.target.
+# Units ordered into early boot are refused outright: anything carrying
+# DefaultDependencies=no, any socket unit, and anything with Before= or
+# WantedBy= naming sysinit, basic, local-fs or cryptsetup targets. A socket
+# sits inside basic.target, and one that waits for /home or /etc/dropbear
+# drags the encrypted home into an ordering cycle that freezes PID 1.
+# Third-party units on these tablets belong at multi-user.target.
 #
 # Commands:
 #   rm-persist install            stage into the live /etc and the running
@@ -38,9 +41,7 @@
 #   rm-persist remove NAME.service
 #   rm-persist uninstall          remove all staged copies and the hooks
 #
-# Units directory: /home/root/units (override with RM_PERSIST_UNITS). Service
-# and socket units are staged; a template like name@.service is copied and not
-# enabled, its socket enables it.
+# Units directory: /home/root/units (override with RM_PERSIST_UNITS).
 set -u
 
 UNITS=${RM_PERSIST_UNITS:-/home/root/units}
@@ -98,11 +99,20 @@ update_in_progress() {
 	[ -r "$SWU_STATUS" ] && [ "$(cat "$SWU_STATUS")" = 7 ]
 }
 
-# A boot that reached multi-user.target and has xochitl up is the evidence
-# that the staged units are safe to copy to the fallback partition.
+# The unit set as a checksum, so a boot can be tied to what it booted with.
+manifest() {
+	for u in $(units); do md5sum "$u"; done | md5sum | cut -c1-32
+}
+
+# A boot that reached multi-user.target with xochitl up, and that started with
+# exactly the unit set present now, is the evidence that the staged units are
+# safe to copy to the fallback partition. rm-persist boot records the set it
+# found; anything added since waits for the next boot.
 boot_proven() {
 	systemctl -q is-active multi-user.target 2>/dev/null || return 1
 	systemctl -q is-active xochitl.service 2>/dev/null || return 1
+	[ -f "$RUN/boot-manifest" ] || return 1
+	[ "$(cat "$RUN/boot-manifest")" = "$(manifest)" ] || return 1
 	return 0
 }
 
@@ -110,7 +120,7 @@ boot_proven() {
 
 # every unit file we manage
 units() {
-	for u in "$UNITS"/*.service "$UNITS"/*.socket; do
+	for u in "$UNITS"/*.service; do
 		[ -f "$u" ] && echo "$u"
 	done
 }
@@ -137,6 +147,12 @@ check_unit() {
 		echo "$n: ordered before or wanted by an early boot target"
 		return 1
 	fi
+	case "$n" in
+	*.socket)
+		echo "$n: socket units sit inside basic.target, use a service at multi-user.target"
+		return 1
+		;;
+	esac
 	if ! is_template "$u"; then
 		t=$(wanted_by "$u")
 		case "$n" in
@@ -144,7 +160,7 @@ check_unit() {
 		*) t=${t:-multi-user.target} ;;
 		esac
 		case "$t" in
-		multi-user.target | sockets.target | graphical.target | timers.target) ;;
+		multi-user.target | graphical.target | timers.target) ;;
 		*)
 			echo "$n: WantedBy=$t is not a late boot target"
 			return 1
@@ -334,7 +350,19 @@ cmd_sync() {
 	systemctl daemon-reload
 }
 
+# At boot: record the unit set this boot started with, then stage the running
+# partition so the live /etc matches the rootfs copy.
+cmd_boot() {
+	mkdir -p "$RUN"
+	manifest > "$RUN/boot-manifest"
+	cmd_sync
+}
+
 cmd_postupdate() {
+	if ! boot_proven; then
+		log "unit set not proven by this boot, new partition left stock; rerun after a reboot"
+		exit 1
+	fi
 	check_all || die "nothing staged into the new partition"
 	lock
 	log "swupdate reports a finished install, staging into the new partition"
@@ -343,7 +371,7 @@ cmd_postupdate() {
 
 cmd_shutdown() {
 	if ! boot_proven; then
-		log "this boot never reached multi-user with xochitl up, fallback partition left alone"
+		log "unit set not proven by this boot, fallback partition left alone"
 		return 0
 	fi
 	check_all || return 0
@@ -358,7 +386,7 @@ cmd_status() {
 	echo "other root:     $oth"
 	echo "units:          $(ls "$UNITS" 2>/dev/null | tr '\n' ' ')"
 	if hook_live; then echo "swupdate hook:  live"; else echo "swupdate hook:  not in the running swupdate"; fi
-	if boot_proven; then echo "this boot:      proven, fallback staged at shutdown"; else echo "this boot:      not proven yet"; fi
+	if boot_proven; then echo "this boot:      proven with this unit set, fallback staged at shutdown"; else echo "this boot:      not proven with this unit set, fallback stays as it is"; fi
 	check() {
 		for u in $(units); do
 			n=$(basename "$u")
@@ -431,7 +459,8 @@ esac
 
 case "${1:-}" in
 install) cmd_install ;;
-sync | boot) cmd_sync ;;
+sync) cmd_sync ;;
+boot) cmd_boot ;;
 postupdate) cmd_postupdate ;;
 shutdown) cmd_shutdown ;;
 status) cmd_status ;;
