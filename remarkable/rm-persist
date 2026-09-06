@@ -16,16 +16,24 @@
 # reMarkable 1 and 2 the rootfs is writable and the same bind mount lands on
 # the real /etc, so one code path serves every device.
 #
-# Two hooks re-run the staging without anyone touching the device:
+# The other root partition is the fallback, so it only ever receives units
+# from a system that has proven them: at shutdown, after a boot that reached
+# multi-user.target with xochitl running, and from swupdate's post-update
+# command, which runs on the old system right after it has written the new
+# partition. install and boot never touch it. A unit that breaks boot is
+# therefore confined to one partition, and the other one still boots.
 #
-#   swupdate -p         the updater runs `rm-persist postupdate` on the old
-#                       system right after it has flashed the new partition
-#   rm-persist.service  ExecStart at boot and ExecStop at shutdown both
-#                       re-stage into the other partition
+# Units ordered into early boot are refused outright. Anything carrying
+# DefaultDependencies=no, or Before= or WantedBy= naming sysinit.target,
+# basic.target, local-fs.target or cryptsetup.target, can form an ordering
+# cycle with the encrypted /home and leave PID 1 frozen. Third-party units on
+# these tablets belong at multi-user.target or sockets.target.
 #
 # Commands:
-#   rm-persist install            stage everything, enable the hooks
-#   rm-persist sync               re-stage into both partitions
+#   rm-persist install            stage into the live /etc and the running
+#                                 rootfs, enable the units and the hooks
+#   rm-persist sync               same again, by hand
+#   rm-persist check              verify every unit under /home/root/units
 #   rm-persist status             where the units are and whether the hook is live
 #   rm-persist remove NAME.service
 #   rm-persist uninstall          remove all staged copies and the hooks
@@ -90,11 +98,15 @@ update_in_progress() {
 	[ -r "$SWU_STATUS" ] && [ "$(cat "$SWU_STATUS")" = 7 ]
 }
 
-# --- staging -----------------------------------------------------------------
-
-wanted_by() {
-	sed -n 's/^WantedBy=\([^ ]*\).*/\1/p' "$1" | head -n 1
+# A boot that reached multi-user.target and has xochitl up is the evidence
+# that the staged units are safe to copy to the fallback partition.
+boot_proven() {
+	systemctl -q is-active multi-user.target 2>/dev/null || return 1
+	systemctl -q is-active xochitl.service 2>/dev/null || return 1
+	return 0
 }
+
+# --- unit checks ---------------------------------------------------------------
 
 # every unit file we manage
 units() {
@@ -107,6 +119,56 @@ units() {
 is_template() {
 	case "$(basename "$1")" in *@.*) return 0 ;; *) return 1 ;; esac
 }
+
+wanted_by() {
+	sed -n 's/^WantedBy=\([^ ]*\).*/\1/p' "$1" | head -n 1
+}
+
+# Refuse anything ordered into early boot. Prints the reason and fails.
+check_unit() {
+	u=$1
+	n=$(basename "$u")
+	if grep -q '^DefaultDependencies=no' "$u"; then
+		echo "$n: DefaultDependencies=no puts it into early boot"
+		return 1
+	fi
+	early='sysinit\.target|basic\.target|local-fs\.target|local-fs-pre\.target|cryptsetup\.target'
+	if grep -E "^(Before|WantedBy|RequiredBy)=.*($early)" "$u" >/dev/null; then
+		echo "$n: ordered before or wanted by an early boot target"
+		return 1
+	fi
+	if ! is_template "$u"; then
+		t=$(wanted_by "$u")
+		case "$n" in
+		*.socket) t=${t:-sockets.target} ;;
+		*) t=${t:-multi-user.target} ;;
+		esac
+		case "$t" in
+		multi-user.target | sockets.target | graphical.target | timers.target) ;;
+		*)
+			echo "$n: WantedBy=$t is not a late boot target"
+			return 1
+			;;
+		esac
+	fi
+	if command -v systemd-analyze >/dev/null 2>&1; then
+		if ! systemd-analyze verify "$u" >/dev/null 2>&1; then
+			echo "$n: systemd-analyze verify rejects it"
+			return 1
+		fi
+	fi
+	return 0
+}
+
+check_all() {
+	bad=0
+	for u in $(units); do
+		msg=$(check_unit "$u") || { log "refusing $msg"; bad=1; }
+	done
+	return $bad
+}
+
+# --- staging -------------------------------------------------------------------
 
 # stage ETC ROOT: copy every unit under $UNITS into ETC/systemd/system, add the
 # wants symlink, and drop the swupdate hook when ROOT carries an swupdate that
@@ -156,8 +218,11 @@ with_current_root() {
 	$action "$RUN/root/etc" "$RUN/root"
 	rc=$?
 	sync
-	umount "$RUN/root"
-	[ "$ro" = 1 ] && mount -o remount,ro / || true
+	if umount "$RUN/root"; then
+		[ "$ro" = 1 ] && mount -o remount,ro / || true
+	else
+		log "bind mount at $RUN/root still busy, / left writable"
+	fi
 	return $rc
 }
 
@@ -211,7 +276,7 @@ write_own_unit() {
 	mkdir -p "$UNITS"
 	cat > "$UNITS/rm-persist.service" <<UNITEOF
 [Unit]
-Description=Stage third-party systemd units into both root partitions
+Description=Stage third-party systemd units, fallback partition at shutdown
 RequiresMountsFor=/home/root
 After=home.mount
 Before=swupdate.service
@@ -245,10 +310,10 @@ cmd_install() {
 	}
 	ln -sf rm-persist "$SELF-postupdate"
 	write_own_unit
+	check_all || die "nothing staged"
 	lock
 	stage /etc /
 	with_current_root stage
-	with_other_root stage || true
 	reload_swupdate
 	for u in $(units); do
 		is_template "$u" && continue
@@ -258,23 +323,30 @@ cmd_install() {
 	exec 9>&-
 	systemctl start rm-persist.service 2>/dev/null || true
 	log "installed: $(ls "$UNITS" | tr '\n' ' ')"
+	log "the other root partition is staged at the next clean shutdown"
 }
 
 cmd_sync() {
+	check_all || die "nothing staged"
 	lock
 	stage /etc /
 	with_current_root stage
-	with_other_root stage || true
 	systemctl daemon-reload
 }
 
 cmd_postupdate() {
+	check_all || die "nothing staged into the new partition"
 	lock
 	log "swupdate reports a finished install, staging into the new partition"
 	with_other_root stage
 }
 
 cmd_shutdown() {
+	if ! boot_proven; then
+		log "this boot never reached multi-user with xochitl up, fallback partition left alone"
+		return 0
+	fi
+	check_all || return 0
 	lock
 	with_other_root stage || true
 }
@@ -286,6 +358,7 @@ cmd_status() {
 	echo "other root:     $oth"
 	echo "units:          $(ls "$UNITS" 2>/dev/null | tr '\n' ' ')"
 	if hook_live; then echo "swupdate hook:  live"; else echo "swupdate hook:  not in the running swupdate"; fi
+	if boot_proven; then echo "this boot:      proven, fallback staged at shutdown"; else echo "this boot:      not proven yet"; fi
 	check() {
 		for u in $(units); do
 			n=$(basename "$u")
@@ -313,6 +386,13 @@ cmd_status() {
 		n=$(basename "$u")
 		echo "$n: $(systemctl is-active "$n" 2>/dev/null) / $(systemctl is-enabled "$n" 2>/dev/null)"
 	done
+}
+
+cmd_check() {
+	for u in $(units); do
+		if msg=$(check_unit "$u"); then echo "$(basename "$u") ok"; else echo "$msg"; fi
+	done
+	check_all
 }
 
 cmd_remove() {
@@ -355,10 +435,11 @@ sync | boot) cmd_sync ;;
 postupdate) cmd_postupdate ;;
 shutdown) cmd_shutdown ;;
 status) cmd_status ;;
+check) cmd_check ;;
 remove) cmd_remove "${2:?unit name}" ;;
 uninstall) cmd_uninstall ;;
 *)
-	sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'
+	sed -n '2,44p' "$0" | sed 's/^# \{0,1\}//'
 	exit 1
 	;;
 esac
