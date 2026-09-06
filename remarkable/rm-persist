@@ -108,9 +108,17 @@ manifest() {
 # exactly the unit set present now, is the evidence that the staged units are
 # safe to copy to the fallback partition. rm-persist boot records the set it
 # found; anything added since waits for the next boot.
+# The activation timestamps outlive the shutdown ordering, so this also holds
+# from ExecStop while the targets are already on their way down.
 boot_proven() {
-	systemctl -q is-active multi-user.target 2>/dev/null || return 1
-	systemctl -q is-active xochitl.service 2>/dev/null || return 1
+	now=$(awk '{ printf "%d", $1 * 1000000 }' /proc/uptime)
+	for u in multi-user.target xochitl.service; do
+		t=$(systemctl show "$u" -p ActiveEnterTimestampMonotonic --value 2>/dev/null)
+		[ "${t:-0}" -gt 0 ] || return 1
+	done
+	# xochitl up for a minute, so a crash loop does not count
+	t=$(systemctl show xochitl.service -p ActiveEnterTimestampMonotonic --value 2>/dev/null)
+	[ $((now - t)) -gt 60000000 ] || return 1
 	[ -f "$RUN/boot-manifest" ] || return 1
 	[ "$(cat "$RUN/boot-manifest")" = "$(manifest)" ] || return 1
 	return 0
